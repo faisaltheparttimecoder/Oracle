@@ -1,2 +1,1 @@
-# Oracle
-General Oracle Administration Scripts
+This Repository contain some General Oracle Administration Scripts..
