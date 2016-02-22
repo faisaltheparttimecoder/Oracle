@@ -1,7 +1,7 @@
 
 # Aim 
 
-This script is designed to use the ORACLE inbuilt DBI_ALERT package infrastructure to build up the monitoring tool for the organisation.
+This script is designed to use the ORACLE inbuilt DBMS_SERVER_ALERT package infrastructure to build up the monitoring tool for the organisation.
 
 # Execution 
 
