@@ -1,0 +1,641 @@
+#!/bin/ksh
+######################################################################################################
+# Script name : inf_rac_alerts.sh
+# Author      : Faisal
+# date        : 7/21/2010
+# Purpose     : To alert on RAC infrastructure. 
+# Description : The script below does the following task.  		
+# 		1. Check for the database availability.
+#		2. Check for Diskgroup status and alerts if it reached its threshold
+#   		3. Check for tablespace status and alerts if it reached its threshold
+# Requirment  : The script accepts two parameters 
+#		1. ORACLE_SID - database name
+#		2. Incident type: E = email or T = ticket
+#------------------------------------------------------------------------------------------------------
+
+# ~/.profile
+
+echo
+echo INFO - Reading the in use script function - start.
+echo 
+echo
+
+##
+##
+##-------------------------------- Check for Database Availability -------------------------------------
+##
+##
+
+echo
+echo INFO - Reading the Database availability function.
+echo 
+echo
+
+check_db_avaliabilty()
+{
+
+# Initialize database status as
+
+sqlplus -s /nolog <<EOF >$db_avail_templog >>$db_avail_templog
+
+connect / as sysdba
+   set pagesize 0
+   set echo off
+   set feedback off
+   set verify off
+   set heading off
+
+   select null from dual;
+  
+EOF
+retcode=$?
+if [ $retcode -ne 0 ] || ( grep "ORA-" $db_avail_templog > /dev/null 2>> /dev/null )
+then
+     echo 
+     echo "WARN - The database is not running on this server. "
+     echo "WARN - The database might not be running with a correct ORACLE HOME. "
+     echo "WARN - Or the database could not be reached due to some other problems. "
+     echo
+     echo INFO - The error message recieved while trying to connect to the database.
+     echo
+     
+     grep ORA- $db_avail_templog
+
+     # Check if at least smon process is up (if archivelog space is full, above query may fail)
+
+     echo
+     echo "INFO - if archivelog space is full, above warning is not valid , so checking the status of smon. "
+     echo "INFO - Checking if SMON is up "
+     echo
+     echo
+     	if (! ps -ef |grep smon | grep -i $ORACLE_SID |grep -v grep > /dev/null)
+	then
+		echo
+     		echo  "WARN - SMON process of the database is not running on this node/server"
+     		
+     		export statusfile3=${tmpdir}/${script_basename}.${ORACLE_SID}_DB_availability.log 
+		
+		echo
+		echo "INFO - Removing the statusfile , if the statusfile is older than 1 days = 24 hrs."
+		echo
+		echo
+	
+		find "${tmpdir}" -name "${script_basename}.${ORACLE_SID}_DB_*" -mtime +${retension_period} -exec rm {} \;
+
+		if  (! test -f $statusfile3 )
+	      	then
+	      
+	      		echo  "WARN - Notify the Oracle Oncall on the issue"
+     			echo `date` `hostname` "ORACLE:"${cric_severity}":ORC1101:"${ORACLE_SID}:${INCIDENT_TYPE}:${script_basename} " ORACLE Database ${ORACLE_SID} currently is unreachable on server" `hostname` "- Please notify ORACLE DBA ONCALL". >> $tivoli_log
+     			echo
+     			echo "INFO - Exiting successfully at" `date`
+     			echo
+     			
+     			touch ${statusfile3}
+	      		
+	      		exit 106
+	      	fi
+	      	echo
+		echo INFO - The alert has already been send for this database $ORACLE_SID.
+		echo INFO - $statusfile3 exist.  contiuing without raising a tivoli alert.
+		echo	
+     		exit 107
+	fi
+	
+	echo
+	echo  "INFO - SMON process of the database is running on this node/server. "
+	echo  "INFO - Continuing the program. "
+	echo
+	
+fi
+
+}
+
+
+##
+##
+##-------------------------------- Check for Disk Group status -------------------------------------
+##
+##
+
+echo
+echo INFO - Reading the Disk group status function.
+echo 
+echo
+
+check_dg_status()
+{
+
+sqlplus -s / << EOF >$dg_status_templog >>$dg_status_templog
+
+
+SET LINESIZE  145
+SET PAGESIZE  0
+SET VERIFY    off
+SET HEADING OFF
+SET FEEDBACK OFF
+SET ECHO OFF
+
+COLUMN group_name             FORMAT a20           HEAD 'Disk Group|Name'
+COLUMN sector_size            FORMAT 99,999        HEAD 'Sector|Size'
+COLUMN block_size             FORMAT 99,999        HEAD 'Block|Size'
+COLUMN allocation_unit_size   FORMAT 999,999,999   HEAD 'Allocation|Unit Size'
+COLUMN state                  FORMAT a11           HEAD 'State'
+COLUMN type                   FORMAT a6            HEAD 'Type'
+COLUMN total_gb               FORMAT 999999999     HEAD 'Total Size (GB)'
+COLUMN used_gb                FORMAT 999999999     HEAD 'Used Size (GB)'
+COLUMN pct_used               FORMAT 999.99        HEAD 'Pct. Used'
+
+SELECT
+    name                                     	group_name
+ -- , sector_size                              	sector_size
+ -- , block_size                               	block_size
+ -- , allocation_unit_size                     	allocation_unit_size
+ -- , state                                    	state
+ -- , type                                     	type
+  , total_mb /1024                           	total_gb
+  , (total_mb - free_mb)/1024                	used_gb
+  , ROUND((1- (free_mb / total_mb))*100, 2)  	pct_used
+FROM
+    v\$asm_diskgroup
+WHERE ROUND((1- (free_mb / total_mb))*100, 2) > ${dg_alert_thershold}
+AND   state = 'CONNECTED'
+ORDER BY
+    name
+
+/
+
+
+exit 
+EOF
+
+}
+
+##
+##
+##-------------------------------- Alerting the diskgroup above 90% -------------------------------------
+##
+##
+
+echo
+echo INFO - Reading the Disk group alert function.
+echo 
+echo
+
+alert_dg_status()
+{
+
+
+cat $dg_status_templog | while read a b c d 
+do
+
+export group_name=$a
+export total_gb=$b
+export used_gb=$c
+export pct_used=$d
+export statusfile=${tmpdir}/${script_basename}.${ORACLE_SID}_DG_${group_name}.log 
+
+echo
+echo "INFO - Removing the statusfile , if the statusfile is older than 1 days = 24 hrs."
+echo
+echo
+
+find "${tmpdir}" -name "${script_basename}.${ORACLE_SID}_DG_*" -mtime +${retension_period} -exec rm {} \;
+
+
+if  (! test -f $statusfile )
+      then
+      
+      echo
+      echo "INFO - Detected a diskgroup which have reached its threshold, Placing an entry in the tivoli log."
+      echo `date` `hostname` "ORACLE:"${warn_severity}":ORC1102:"${ORACLE_SID}:${INCIDENT_TYPE}:${script_basename} "ASM DISKGROUP" ${group_name} "is currently" ${pct_used}"% occupied - Please add / resize the disk or request for new disk - current status total_GB/used_GB="$total_gb/$used_gb "- Please notify ORACLE DBA ONCALL". >> $tivoli_log
+      echo
+      echo "INFO - Creating a statusfile so that it doesnt send any more email/incident for the same disk group threshold once the alert is detected."
+      echo
+      echo
+      
+      touch ${statusfile}
+      
+      continue
+fi
+
+echo
+echo INFO - The alert has already been send for this disk group $group_name threshold.
+echo INFO - $statusfile exist.  contiuing without raising a tivoli alert.
+echo
+
+
+done
+
+}
+
+##
+##
+##-------------------------------- Checking for the tablespace thresholds. -------------------------------------
+##
+##
+
+
+echo
+echo INFO - Reading the tablespace status function.
+echo 
+echo
+
+check_tb_status()
+{
+
+
+sqlplus -s / << EOF >$tb_status_templog >>$tb_status_templog
+
+SET HEADING OFF
+SET LINESIZE 180
+SET PAGESIZE 0
+SET VERIFY   OFF
+SET FEEDBACK OFF
+
+COLUMN db_name     FORMAT a10                HEADING 'Db Name'
+COLUMN server_name FORMAT a15                HEADING 'Server Name'
+COLUMN status      FORMAT a9                 HEADING 'Status'
+COLUMN name        FORMAT a15                HEADING 'Tablespace Name'
+COLUMN type        FORMAT a12                HEADING 'TS Type'
+COLUMN extent_mgt  FORMAT a10                HEADING 'Ext. Mgt.'
+COLUMN segment_mgt FORMAT a9                 HEADING 'Seg. Mgt.'
+COLUMN ts_size     FORMAT 9999999999999      HEADING 'Tablespace Size'
+COLUMN used        FORMAT 9999999999999      HEADING 'Used (in Mbytes)'
+COLUMN free        FORMAT 9999999999999      HEADING 'Free (in Mbytes)'
+COLUMN pct_used    FORMAT 999                HEADING 'Pct. Used'
+
+
+SELECT  d.tablespace_name NAME
+--	, d.status status
+--	, d.CONTENTS TYPE
+--	, d.extent_management extent_mgt
+--	, d.segment_space_management segment_mgt
+	, (NVL (a.BYTES, 0) / (1024 * 1024)) ts_size
+	, (NVL (a.BYTES - NVL (f.BYTES, 0), 0) / (1024 * 1024)) used
+	,  NVL (f.BYTES / 1024 / 1024, 0) free
+	,  NVL ((a.BYTES - NVL (f.BYTES, 0)) / a.BYTES * 100, 0) pct_used
+  FROM SYS.dba_tablespaces d,
+       (SELECT   tablespace_name, SUM (BYTES) BYTES
+            FROM dba_data_files
+        GROUP BY tablespace_name) a,
+       (SELECT   tablespace_name, SUM (BYTES) BYTES
+            FROM dba_free_space
+        GROUP BY tablespace_name) f
+  WHERE d.tablespace_name = a.tablespace_name(+)
+   AND d.tablespace_name = f.tablespace_name(+)
+   AND NOT (    d.extent_management LIKE 'LOCAL'
+            AND d.CONTENTS IN ('TEMPORARY', 'UNDO')
+           )
+   AND NVL ((a.BYTES - NVL (f.BYTES, 0)) / a.BYTES * 100, 0) > ${tb_alert_thershold};
+
+
+exit 
+EOF
+
+}
+
+
+##
+##
+##-------------------------------- Alerting the tablespace above 90% -------------------------------------
+##
+##
+
+echo
+echo INFO - Reading the tablespace alert function.
+echo 
+echo
+
+alert_tb_status()
+{
+
+cat $tb_status_templog | while read a1 b1 c1 d1 e1 
+do
+
+
+export tb_name=$a1
+export ts_size=$b1
+export used=$c1 
+export free=$d1
+export pct_used=$e1
+export statusfile1=${tmpdir}/${script_basename}.${ORACLE_SID}_TB_${tb_name}.log 
+
+echo
+echo "INFO - Removing the statusfile , if the statusfile is older than 1 days = 24 hrs."
+echo
+echo
+
+find "${tmpdir}" -name "${script_basename}.${ORACLE_SID}_TB_*" -mtime +${retension_period} -exec rm {} \;
+
+
+if  (! test -f $statusfile1 )
+      then
+      
+      echo
+      echo "INFO - Detected a tablespace which have reached its threshold, Placing an entry in the tivoli log."
+      echo `date` `hostname` "ORACLE:"${warn_severity}":ORC1103:"${ORACLE_SID}:${INCIDENT_TYPE}:${script_basename} "TABLESPACE" ${tb_name} "is currently" ${pct_used}"% occupied - Please add / resize the tablespace - current status total_MB/used_MB/free_MB="${ts_size}/${used}/${free} "- Please notify ORACLE DBA ONCALL". >> $tivoli_log
+      echo
+      echo "INFO - Creating a statusfile so that it doesnt send any more email/incident for the same tablespace threshold once the alert is detected."
+      echo
+      echo
+      
+      touch ${statusfile1}
+      
+      continue
+fi
+
+echo
+echo INFO - The alert has already been send for this tablespace $tb_name threshold.
+echo INFO - $statusfile1 exist.  contiuing without raising a tivoli alert.
+echo
+
+done
+
+}
+
+echo
+echo INFO - Reading the in use script function - complete.
+echo 
+echo
+
+#
+##
+##-------------------------------- Main Program Starts -------------------------------------
+##
+##
+
+#
+##
+##-------------------------------- Check syntax of the execution -------------------------------------
+##
+##
+
+echo
+echo INFO - Checking for the variable passed for the script - start.
+echo 
+echo
+
+if [ $# -lt 2 ] 
+then
+    echo "ERR- Insufficient parameters "
+    echo "     1. Destination Database "
+    echo "     2. Incident type: E = email or T = ticket "
+    exit 1
+fi
+
+echo
+echo INFO - Checking for the variable passed for the script - complete.
+echo 
+echo
+
+
+##
+##
+##-------------------------------- Accepting the parameter  -------------------------------------
+##
+##
+
+echo
+echo INFO - Passing the variable passed for the script to a local variable - start.
+echo 
+echo
+
+ORACLE_SID=$1 ;export ORACLE_SID
+INCIDENT_TYPE=$2 ; export INCIDENT_TYPE
+
+echo
+echo INFO - Passing the variable passed for the script to a local variable - complete.
+echo 
+echo
+
+
+##
+##
+##-------------------------------- verification of the variable passed  -------------------------------------
+##
+##
+
+echo
+echo INFO - verification of the variable passed for the script to a local variable is valid/inavlid - start.
+echo 
+echo
+
+#if [ "$INCIDENT_TYPE" != "T" -o "$INCIDENT_TYPE" != "E"] 
+#then
+#	echo " ERR - Invalid Parameters passed "
+#   	echo " Incident type incorrectly specified. "
+#   	echo " Incident type: E = email or T = ticket "
+#   	echo
+#   	exit 102
+#fi
+
+echo
+echo INFO - verification of the variable passed for the script to a local variable is valid/inavlid - complete.
+echo 
+echo
+
+##
+##
+##-------------------------------- Accepting the parameter  -------------------------------------
+##
+##
+
+echo
+echo INFO - Accepting the variables that is important for the alert - start.
+echo 
+echo
+
+
+#ORATAB=/var/opt/oracle/oratab ;export ORATAB
+ORATAB=/etc/oratab ;export ORATAB
+retension_period=0 ; export retension_period
+tivoli_log=/apps/log/target_oracle_alerts.log ; export tivoli_log
+dg_alert_thershold=90 ; export=dg_alert_thershold
+tb_alert_thershold=90 ; export=tb_alert_thershold
+warn_severity=SEVERITY3; export $warn_severity
+cric_severity=SEVERITY2; export $cric_severity
+
+
+echo
+echo INFO - Accepting the variables that is important for the alert - complete.
+echo 
+echo
+
+##
+##
+##-------------------------------- Calling of inside script parameters-------------------------------------
+##
+##
+
+echo
+echo INFO - Setting the local paramaters for the scripts to run - start
+echo 
+echo
+
+
+export script=$0
+export script_basename=`basename $script`
+export script_dir=`dirname $script`
+cd $script_dir
+export script_dir=`pwd`
+export install_dir=`dirname $script_dir`
+export logdir=$install_dir/log
+tmpdir=$install_dir/tmp ;export tmpdir
+logfile=${logdir}/${script_basename}.${ORACLE_SID}.log ; export logfile
+db_avail_templog=${tmpdir}/${script_basename}.${ORACLE_SID}_db_availability.log ; export db_avail_templog
+dg_status_templog=${tmpdir}/${script_basename}.${ORACLE_SID}_dg_size_status.log ; export dg_status_templog
+tb_status_templog=${tmpdir}/${script_basename}.${ORACLE_SID}_tb_size_status.log ; export tb_status_templog
+now=`date` ; export now
+
+echo
+echo INFO - Setting the local paramaters for the scripts to run - complete
+echo 
+echo
+
+
+
+
+##
+##
+##-------------------------------- Direct messages to logfile -------------------------------------
+##
+##
+## 
+
+echo
+echo INFO - Redirecting the logs to the location/file $logfile
+echo 
+echo
+
+exec > $logfile 2>> $logfile
+
+echo
+echo INFO - All the output of the script will be now logged in this logfile.
+echo 
+echo
+
+##
+##
+##-------------------------------- Get ORACLE_HOME variable-------------------------------------
+##
+##
+
+echo
+echo INFO - Setting the Oracle environment paramaters - start.
+echo 
+echo
+
+
+TNS_ADMIN=/usr/local/tns ; export TNS_ADMIN
+ORACLE_HOME=`grep $ORACLE_SID $ORATAB | grep -v ^# | cut -d: -f2` ;export ORACLE_HOME
+PATH=$ORACLE_HOME/bin:$PATH ;export PATH
+LD_LIBRARY_PATH=$ORACLE_HOME/lib:$LD_LIBRARY_PATH ;export LD_LIBRARY_PATH
+
+echo
+echo INFO - Setting the Oracle environment paramaters - complete.
+echo 
+echo
+
+
+echo
+echo INFO - Starting of the program.
+echo 
+echo
+
+
+echo
+echo INFO - Database: $ORACLE_SID  
+echo
+echo INFO - Environment :
+echo INFO - ORACLE_SID=$ORACLE_SID,  
+echo INFO - ORACLE_HOME=$ORACLE_HOME
+echo INFO - PATH=$PATH
+echo INFO - LD_LIBRARY_PATH=$LD_LIBRARY_PATH
+echo INFO - HOSTNAME = `hostname`
+echo 
+echo INFO - START TIME OF THE SCRIPT : $now
+echo
+
+echo
+echo INFO - Starting the main process
+echo
+echo
+
+
+
+echo
+echo INFO - The verification if the database is up and running - start.
+echo
+echo
+
+check_db_avaliabilty
+
+echo
+echo INFO - The verification if the database is up and running - complete.
+echo
+echo
+
+echo
+echo INFO - The information on the Disk group from the database - start.
+echo 
+echo
+
+check_dg_status
+
+echo
+echo INFO - The information on the Disk group from the database - compelete.
+echo 
+echo
+
+
+echo
+echo INFO - Reading the extracted logfile on the diskgroup and finding if there is any diskgroup above ${dg_alert_thershold}% and alerting if neccessary - start.
+echo 
+echo
+
+alert_dg_status
+
+echo
+echo INFO - Reading the extracted logfile on the diskgroup and finding if there is any diskgroup above ${dg_alert_thershold}% and alerting if neccessary - complete.
+echo 
+echo
+
+
+echo
+echo INFO - Getting the information of the tablespace from the database - start.
+echo 
+echo
+
+check_tb_status
+
+echo
+echo INFO - Getting the information of the tablespace from the database - complete.
+echo 
+echo
+
+echo
+echo INFO - Reading the extracted logfile on the tablespace and finding if there is any tablespace above ${tb_alert_thershold}% and alerting if neccessary - start.
+echo 
+echo
+
+alert_tb_status
+
+echo
+echo INFO - Reading the extracted logfile on the tablespace and finding if there is any tablespace above ${tb_alert_thershold}% and alerting if neccessary - complete.
+echo 
+echo
+
+echo 
+echo INFO - The program has been successfully run - the logfile for this program is available at ${logfile}.
+echo INFO - Please check the ${tivoli_log} file to check if the alert has been send out by the program.
+echo INFO - If you find that an entry in the ${tivoli_log} and no email or incident was send out - please check with the ESM Team.
+echo
+
+echo
+echo
+echo "INFO - Exiting successfully at" `date`
+
+echo
+
+exit 0

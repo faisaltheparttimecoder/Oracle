@@ -1,0 +1,528 @@
+#!/bin/ksh
+######################################################################################################
+# Script name 		: inf_dataguard_alerts.sh
+# Author      		: Scott Ransom
+# Modified    		: Faisal
+# Initial Creation 	: 02/23/2009
+# Modified date		: 7/21/2010
+# Purpose     		: To alert on Dataguard infrastructure. 
+# Description 		: The script below does the following task.  		
+# 				1. Check the current sequence number from the primary database.
+#				2. Check the current sequence number from the standby database.
+#   				3. Compare the difference and alert when the difference is greater than paramter log_diff.
+# Requirment  		: The script accepts two parameters 
+#				1. ORACLE_SID_primary - Primary database name
+#				2. ORACLE_SID_standby - Standby database name
+#				3. Incident type: E = email or T = ticket
+#------------------------------------------------------------------------------------------------------
+
+# ~/.profile
+
+echo
+echo INFO - Reading the in use script function - start.
+echo 
+echo
+
+##
+##
+##-------------------------------- The Database envirnoment configuration functions -------------------------------------
+##
+##
+
+echo
+echo INFO - Reading the Database envirnoment configuration functions.
+echo 
+echo
+
+Set_Env_primary ()
+{
+
+export SQL_SCRIPT1=${tmpdir}/dataguard_chk_primary.lst
+export ORACLE_HOME=`cat $oratab | egrep -i ${ORACLE_SID_primary} | awk -F: '{print $2}'`
+export RPT_FILE1="${tmpdir}/dataguard_chk_primary.lst"
+export RPT_FILE2="${tmpdir}/dataguard_chk_standby.lst"
+export PATH=${ORACLE_HOME}/bin:/usr/bin:/usr/sbin:/usr/ucb:/usr/openwin/bin:/usr/local/bin:/etc:/sys01/oracle/bin
+export LD_LIBRARY_PATH=${ORACLE_HOME}/lib:/usr/lib:/usr/dt/lib/usr/ccs/lib
+export TNS_ADMIN=/usr/local/tns
+export ALERT="${tmpdir}/dataguard_alert.txt"
+#export MAIL_LIST="scott.ransom@target.com"
+#export MAIL_LIST="scott.ransom@target.com andrew.geier@target.com TTS-DB-Tech-Oracle-tech@target.com TTS-DB-Tech-Oracle-Alerts@target.com"
+
+}
+
+##
+##
+##-------------------------------- The old reports cleanup functions -------------------------------------
+##
+##
+
+echo
+echo INFO - Reading old reports cleanup functions.
+echo 
+echo
+
+Clear_Old_Rpts ()
+{
+
+cat /dev/null > ${RPT_FILE1}
+cat /dev/null > ${RPT_FILE2}
+
+}
+
+
+##
+##
+##-------------------------------- The Primary database check functions -------------------------------------
+##
+##
+
+echo
+echo INFO - The Primary database check functions.
+echo 
+echo
+
+Dataguard_Chk_primary ()
+{
+
+${ORACLE_HOME}/bin/sqlplus -s /@$ORACLE_SID_primary <<ENDSQL > ${SQL_SCRIPT1}
+
+-- sql statement to check on the current sequence# on the primary db
+set heading off
+set feedback off
+set linesize 75
+set pagesize 60
+
+-- The current redo log on the primary
+SELECT to_char(MAX(sequence#)) FROM v\$log;
+
+ENDSQL
+
+}
+
+
+##
+##
+##-------------------------------- The standby database environment Configuration functions -------------------------------------
+##
+##
+
+echo
+echo INFO - The standby database environment Configuration functions.
+echo 
+echo
+
+Set_Env_standby ()
+{
+export SQL_SCRIPT2="${tmpdir}/dataguard_chk_standby.lst"
+export ORACLE_HOME=`cat $oratab | egrep -i ${ORACLE_SID_standby} | awk -F: '{print $2}'`
+export PATH=${ORACLE_HOME}/bin:/usr/bin:/usr/sbin:/usr/ucb:/usr/openwin/bin:/usr/local/bin:/etc:/sys01/oracle/bin
+export LD_LIBRARY_PATH=${ORACLE_HOME}/lib:/usr/lib:/usr/dt/lib/usr/ccs/lib
+}
+
+##
+##
+##-------------------------------- The standby database check functions -------------------------------------
+##
+##
+
+echo
+echo INFO - The Primary database check functions.
+echo 
+echo
+
+Dataguard_Chk_standby ()
+{
+
+${ORACLE_HOME}/bin/sqlplus -s /@$ORACLE_SID_standby <<ENDSQL > ${SQL_SCRIPT2}
+
+ -- sql statement to check on the current sequence# on the standby db
+ set heading off
+ set linesize 75
+ set pagesize 60
+ 
+ -- The current redo log on the standby
+ SELECT to_char(MAX(sequence#)) from dba_logstdby_log where applied in ('CURRENT','YES');
+ 
+ENDSQL
+
+}
+
+##
+##
+##-------------------------------- The verification and sending out alert functions -------------------------------------
+##
+##
+
+echo
+echo INFO - The verification and sending out alert functions.
+echo 
+echo
+
+Compare_and_alert ()
+{
+
+mv ${SQL_SCRIPT1} ${tmpdir}/dataguard_chk_primary_tmp.lst
+sed /^$/d ${tmpdir}/dataguard_chk_primary_tmp.lst > ${SQL_SCRIPT1} 
+mv ${SQL_SCRIPT2} ${tmpdir}/dataguard_chk_standby_tmp.lst
+sed /^$/d ${tmpdir}/dataguard_chk_standby_tmp.lst > ${SQL_SCRIPT2}
+rm ${tmpdir}/dataguard_chk_primary_tmp.lst
+rm ${tmpdir}/dataguard_chk_standby_tmp.lst
+
+#  read values into variables.
+
+cat ${RPT_FILE1} | while read LINE
+do
+primary_val=`echo $LINE | awk -F: '{print $1}'`
+done
+
+cat ${RPT_FILE2} | while read LINE
+do
+standby_val=`echo $LINE | awk -F: '{print $1}'`
+done
+
+# calculate the difference
+
+diff=`expr $primary_val - $standby_val`
+
+#if [ "`echo $diff`" -gt 3 ]
+#   then SEND_MAIL="true"
+#   else SEND_MAIL="false"
+#fi
+
+if [ "`echo $diff`" -gt $log_diff ]
+then
+   export statusfile4=${tmpdir}/${script_basename}_dataguard.log 
+   
+   echo
+   echo "INFO - Removing the statusfile , if the statusfile is older than 1 days = 24 hrs."
+   echo
+   echo
+   
+   find "${tmpdir}" -name "${script_basename}_dataguard*" -mtime +${retension_period} -exec rm {} \;
+   
+   
+   if  (! test -f $statusfile4 )
+         then
+         
+         echo
+         echo "INFO - Detected a tablespace which have reached its threshold, Placing an entry in the tivoli log."
+         echo `date` `hostname` "ORACLE:"${cric_severity}":ORC1106:"${ORACLE_SID_standby}:${INCIDENT_TYPE}:${script_basename} "Primary Database" ${ORACLE_SID_primary} " and the Standby Database " ${ORACLE_SID_standby}" is out of sync , please pass the logs so that the database become in sync - Please notify ORACLE DBA ONCALL". >> $tivoli_log
+         echo
+         echo "INFO - Creating a statusfile so that it doesnt send any more email/incident for the same tablespace threshold once the alert is detected."
+         echo
+         echo
+         
+         touch ${statusfile4}
+         
+         continue
+   fi
+   
+   echo
+   echo INFO - The alert has already been send for this dataguard threshold.
+   echo INFO - $statusfile4 exist.  contiuing without raising a tivoli alert.
+   echo
+
+   
+fi
+}
+
+##
+##
+##-------------------------------- The alert notification functions -------------------------------------
+##
+##
+
+echo
+echo INFO - The alert notification functions.
+echo 
+echo
+
+Send_Email ()
+{
+echo "Sending Email"
+/usr/ucb/Mail -s "${ORACLE_SID_primary} DataGuard Alert! (`/bin/date`)" ${MAIL_LIST} < ${ALERT}
+}
+
+
+
+echo
+echo INFO - Reading the in use script function - complete.
+echo 
+echo
+
+
+#
+##
+##-------------------------------- Main Program Starts -------------------------------------
+##
+##
+
+#
+##
+##-------------------------------- Check syntax of the execution -------------------------------------
+##
+##
+
+echo
+echo INFO - Checking for the variable passed for the script - start.
+echo 
+echo
+
+if [ $# -lt 3 ] 
+then
+    echo "ERR- Insufficient parameters "
+    echo "     1. Primary Destination Database "
+    echo "     2. Standby Database "
+    echo "     3. Incident type: E = email or T = ticket "
+    exit 1
+fi
+
+echo
+echo INFO - Checking for the variable passed for the script - complete.
+echo 
+echo
+
+##
+##
+##-------------------------------- Accepting the parameter  -------------------------------------
+##
+##
+
+echo
+echo INFO - Passing the variable passed for the script to a local variable - start.
+echo 
+echo
+
+ORACLE_SID_primary=$1 ;export ORACLE_SID_primary
+ORACLE_SID_standby=$2;export ORACLE_SID_standby
+INCIDENT_TYPE=$3 ; export INCIDENT_TYPE
+
+echo
+echo INFO - Passing the variable passed for the script to a local variable - complete.
+echo 
+echo
+
+
+##
+##
+##-------------------------------- verification of the variable passed  -------------------------------------
+##
+##
+
+echo
+echo INFO - verification of the variable passed for the script to a local variable is valid/inavlid - start.
+echo 
+echo
+
+#if [ "$INCIDENT_TYPE" != "T" -o "$INCIDENT_TYPE" != "E"] 
+#then
+#	echo " ERR - Invalid Parameters passed "
+#   	echo " Incident type incorrectly specified. "
+#   	echo " Incident type: E = email or T = ticket "
+#   	echo
+#   	exit 102
+#fi
+
+echo
+echo INFO - verification of the variable passed for the script to a local variable is valid/inavlid - complete.
+echo 
+echo
+
+##
+##
+##-------------------------------- Accepting the parameter  -------------------------------------
+##
+##
+
+echo
+echo INFO - Accepting the variables that is important for the alert - start.
+echo 
+echo
+
+oratab=/var/opt/oracle/oratab ; export oratab
+retension_period=0 ; export retension_period
+tivoli_log=/apps/log/target_oracle_alerts.log ; export tivoli_log
+log_diff=3 ; export log_diff
+warn_severity=SEVERITY3; export $warn_severity
+cric_severity=SEVERITY2; export $cric_severity
+
+
+echo
+echo INFO - Accepting the variables that is important for the alert - complete.
+echo 
+echo
+
+
+
+##
+##
+##-------------------------------- Calling of inside script parameters-------------------------------------
+##
+##
+
+echo
+echo INFO - Setting the local paramaters for the scripts to run - start
+echo 
+echo
+
+
+export script=$0
+export script_basename=`basename $script`
+export script_dir=`dirname $script`
+cd $script_dir
+export script_dir=`pwd`
+export install_dir=`dirname $script_dir`
+export logdir=$install_dir/log
+tmpdir=$install_dir/tmp ;export tmpdir
+sqldir=$install_dir/sql ;export sqldir
+logfile=${logdir}/${script_basename}.dataguard_sync_chk.log ; export logfile
+now=`date` ; export now
+
+echo
+echo INFO - Setting the local paramaters for the scripts to run - complete
+echo 
+echo
+
+
+
+##
+##
+##-------------------------------- Direct messages to logfile -------------------------------------
+##
+##
+## 
+
+echo
+echo INFO - Redirecting the logs to the location/file $logfile
+echo 
+echo
+
+exec > $logfile 2>> $logfile
+
+echo
+echo INFO - All the output of the script will be now logged in this logfile.
+echo 
+echo
+
+##
+##
+##-------------------------------- The call of the program functions starts here -------------------------------------
+##
+##
+## 
+
+
+echo
+echo INFO - Starting of the program.
+echo 
+echo
+
+
+echo
+echo INFO - Primary Database: $ORACLE_SID_primary  
+echo INFO - Standby Database: $ORACLE_SID_standby
+echo INFO - Log difference threshold: $log_diff
+echo INFO - Script Logfile directory: $logfile
+echo INFO - HOSTNAME = `hostname`
+echo 
+echo INFO - START TIME OF THE SCRIPT : $now
+echo
+
+echo
+echo INFO - Starting the main process
+echo
+echo
+
+echo
+echo INFO - The Primary database environment configuration - start.
+echo
+echo
+
+Set_Env_primary
+
+echo
+echo INFO - The Primary database environment configuration - complete.
+echo
+echo
+
+
+echo
+echo INFO - The clean up of old report - start.
+echo
+echo
+
+Clear_Old_Rpts
+
+echo
+echo INFO - The clean up of old report - complete.
+echo
+echo
+
+echo
+echo INFO - The Log sequence check on Primary DB - start.
+echo
+echo
+
+Dataguard_Chk_primary
+
+echo
+echo INFO - The Log sequence check on Primary DB - complete.
+echo
+echo
+
+
+echo
+echo INFO - The Standby database environment configuration - start.
+echo
+echo
+
+Set_Env_standby
+
+
+echo
+echo INFO - The Standby database environment configuration - Complete.
+echo
+echo
+
+echo
+echo INFO - The Log sequence check on Standby DB - start.
+echo
+echo
+
+Dataguard_Chk_standby
+
+echo
+echo INFO - The Log sequence check on Standby DB - Complete.
+echo
+echo
+
+echo
+echo INFO - The verification and sending out alert - start.
+echo
+echo
+
+Compare_and_alert
+
+echo
+echo INFO - The verification and sending out alert - complete.
+echo
+echo
+
+#if [ ${SEND_MAIL} = "true" ]
+#then
+#   Send_Email
+#fi
+
+echo 
+echo INFO - The program has been successfully run - the logfile for this program is available at ${logfile}.
+echo INFO - Please check the ${tivoli_log} file to check if the alert has been send out by the program.
+echo INFO - If you find that an entry in the ${tivoli_log} and no email or incident was send out - please check with the ESM Team.
+echo
+
+echo
+echo
+echo "INFO - Exiting successfully at" `date`
+
+echo
+
+exit 0

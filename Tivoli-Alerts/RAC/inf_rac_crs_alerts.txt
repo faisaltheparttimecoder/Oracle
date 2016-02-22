@@ -1,0 +1,289 @@
+#!/bin/ksh
+#######################################################################################################################################################
+# Script name : inf_rac_crs_alerts.sh
+# Author      : Faisal
+# date        : 7/21/2010
+# Purpose     : CRS resource status query script. 
+# Description : The script does the following task.
+#		1. Returns formatted version of crs_stat -t, in tabular format, with the complete rsc names and filtering keywords 
+# 		2. The argument, $RSC_KEY, is optional and if passed to the script, will limit the output to HA resources whose names match $RSC_KEY.
+# Requirment  : The script accepts two parameters 
+#		1. CRS HOME - Base Location of CRS HOME.
+#		2. Incident type: E = email or T = ticket
+#		3. RSC_KEY - This is optional parameter , if used it will filter the output or will not send out unwanted service alerts.
+#--------------------------------------------------------------------------------------------------------------------------------------------------------
+
+#
+##
+##-------------------------------- Main Program Starts -------------------------------------
+##
+##
+
+#
+##
+##-------------------------------- Check syntax of the execution -------------------------------------
+##
+##
+
+echo
+echo INFO - Checking for the variable passed for the script - start.
+echo 
+echo
+
+if [ $# -lt 2 ] 
+then
+    echo "ERR- Insufficient parameters "
+    echo "     1. CRS HOME - Base Location of CRS HOME. "
+    echo "     2. Incident type: E = email or T = ticket "
+    echo "     3. RSC_KEY - This is optional parameter , if used it will filter the output or will not send out unwanted service alerts. "
+    exit 1
+fi
+
+echo
+echo INFO - Checking for the variable passed for the script - complete.
+echo 
+echo
+
+##
+##
+##-------------------------------- Accepting the parameter  -------------------------------------
+##
+##
+
+echo
+echo INFO - Passing the variable passed for the script to a local variable - start.
+echo 
+echo
+
+ORA_CRS_HOME=$1 ;export ORA_CRS_HOME
+INCIDENT_TYPE=$2 ; export INCIDENT_TYPE
+RSC_KEY=$3 ; export RSC_KEY
+
+echo
+echo INFO - Passing the variable passed for the script to a local variable - complete.
+echo 
+echo
+
+##
+##
+##-------------------------------- verification of the variable passed  -------------------------------------
+##
+##
+
+echo
+echo INFO - verification of the variable passed for the script to a local variable is valid/inavlid - start.
+echo 
+echo
+
+#if [ "$INCIDENT_TYPE" != "T" -o "$INCIDENT_TYPE" != "E"] 
+#then
+#	echo " ERR - Invalid Parameters passed "
+#   	echo " Incident type incorrectly specified. "
+#   	echo " Incident type: E = email or T = ticket "
+#   	echo
+#   	exit 102
+#fi
+
+echo
+echo INFO - verification of the variable passed for the script to a local variable is valid/inavlid - complete.
+echo 
+echo
+
+
+##
+##
+##-------------------------------- Calling of inside script parameters-------------------------------------
+##
+##
+
+echo
+echo INFO - Setting the local paramaters for the scripts to run - start
+echo 
+echo
+
+
+export script=$0
+export script_basename=`basename $script`
+export script_dir=`dirname $script`
+cd $script_dir
+export script_dir=`pwd`
+export install_dir=`dirname $script_dir`
+export logdir=$install_dir/log
+tmpdir=$install_dir/tmp ;export tmpdir
+logfile=${logdir}/${script_basename}_crs_status_chk.log ; export logfile
+crs_status=${tmpdir}/${script_basename}_crs_status.log ; export crs_status
+now=`date` ; export now
+
+echo
+echo INFO - Setting the local paramaters for the scripts to run - complete
+echo 
+echo
+
+
+##
+##
+##-------------------------------- Accepting the parameter  -------------------------------------
+##
+##
+
+echo
+echo INFO - Accepting the variables that is important for the alert - start.
+echo 
+echo
+
+retension_period=0 ; export retension_period
+tivoli_log=/apps/log/target_oracle_alerts.log ; export tivoli_log
+warn_severity=SEVERITY3; export $warn_severity
+cric_severity=SEVERITY2; export $cric_severity
+
+
+echo
+echo INFO - Accepting the variables that is important for the alert - complete.
+echo 
+echo
+
+
+##
+##
+##-------------------------------- Direct messages to logfile -------------------------------------
+##
+##
+## 
+
+echo
+echo INFO - Redirecting the logs to the location/file $logfile
+echo 
+echo
+
+exec > $logfile 2>> $logfile
+
+echo
+echo INFO - All the output of the script will be now logged in this logfile.
+echo 
+echo
+
+##
+##
+##-------------------------------- Other Script parameters -------------------------------------
+##
+##
+## 
+
+echo
+echo INFO - Accepting Other parmaters for the script - start
+echo 
+echo
+
+QSTAT=-u
+AWK=/usr/bin/awk    # if not available use /usr/bin/awk
+
+echo
+echo INFO - Accepting Other parmaters for the script - complete
+echo 
+echo
+ 
+
+##
+##
+##-------------------------------- Main script body -------------------------------------
+##
+##
+## 
+
+echo
+echo INFO - The main body of the script - start
+echo 
+echo
+
+echo
+echo INFO - extracting all crs status in a tabular form
+echo 
+echo
+ 
+# Table body:
+$ORA_CRS_HOME/bin/crs_stat $QSTAT | $AWK \
+ 'BEGIN { FS="="; state = 0; }
+  $1~/NAME/ && $2~/'$RSC_KEY'/ {appname = $2; state=1};
+  state == 0 {next;}
+  $1~/TARGET/ && state == 1 {apptarget = $2; state=2;}
+  $1~/STATE/ && state == 2 {appstate = $2; state=3;}
+  state == 3 {printf "%-45s %-10s %-18s\n", appname, apptarget, appstate; state=0;}' > $crs_status
+  
+echo
+echo INFO - Reading the crs status output and verifying if there is anything to be alerted.
+echo 
+echo  
+  
+cat $crs_status | grep OFFLINE | while read a1 b1 c1 d1 e1 
+do
+  
+  export service_name=$a1
+  export target=$b1
+  export state1=$c1
+  export state2=$d1
+  export state3=$d1
+  export statusfile=${tmpdir}/${script_basename}.crs_${service_name}.log 
+  
+  echo
+  echo "INFO - Removing the statusfile , if the statusfile is older than 1 days = 24 hrs."
+  echo
+  echo
+  
+  find "${tmpdir}" -name "${script_basename}.crs_*" -mtime +${retension_period} -exec rm {} \;
+
+  if [ "$target" != "$state1" ]
+  then
+    
+    if  (! test -f $statusfile )
+        then
+        
+        echo
+        echo "INFO - Detected a crs service offline, Placing an entry in the tivoli log."
+        echo `date` `hostname` "ORACLE:"${warn_severity}":ORC1104:"${INCIDENT_TYPE}:${script_basename} "CRS HA RESOURCE " ${service_name} "is currently offline on server " `hostname` "- Please notify ORACLE DBA ONCALL". >> $tivoli_log
+        echo
+        echo "INFO - Creating a statusfile so that it doesnt send any more email/incident for the same crs ha resource offline once the alert is detected."
+        echo
+        echo
+        
+        touch ${statusfile}
+        
+        continue
+     fi
+ 
+ else 
+    
+    echo
+    echo INFO - The STATE and TARGET of CRS HA resource $service_name is offline.
+    echo INFO - So no alert being send out .  contiuing without raising a tivoli alert.
+    echo
+    
+    continue
+    
+  fi
+
+  echo
+  echo INFO - The alert has already been send for this CRS HA resource $service_name.
+  echo INFO - $statusfile exist.  contiuing without raising a tivoli alert.
+  echo
+
+done
+  
+echo
+echo INFO - The main body of the script - complete
+echo 
+echo
+
+
+echo 
+echo INFO - The program has been successfully run - the logfile for this program is available at ${logfile}.
+echo INFO - Please check the ${tivoli_log} file to check if the alert has been send out by the program.
+echo INFO - If you find that an entry in the ${tivoli_log} and no email or incident was send out - please check with the ESM Team.
+echo
+
+echo
+echo
+echo "INFO - Exiting successfully at" `date`
+
+echo
+
+exit 0
